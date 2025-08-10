@@ -69,3 +69,8 @@ In the read by sentence mode:
 - Use ISO three code (e.g. FRA, GDR...) , colored language chips to indicate the language of the translated sentence.
 
 
+## Implement language dictionaries
+Download the best language dictionaries available:
+- Display an English translation on mouseover a foreign word.
+- Display a foreign word if mouseover an English word.
+- In sentence mode show translated words for all selected languages.
