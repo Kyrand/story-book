@@ -61,6 +61,8 @@ export class ConsoleWrapper {
 
   serializeArg2(arg) {
     // Convert objects to string for transmission
+    if (typeof arg === "string") return arg;
+    if (arg.message) return arg.message;
     if (typeof arg === "object") {
       try {
         return JSON.stringify(arg, null, 2);
@@ -71,14 +73,16 @@ export class ConsoleWrapper {
     return String(arg);
   }
 
-  async sendToBackend(level, args, callerInfo) {
+  async sendToBackend(level, _args, callerInfo) {
+    const args = _args.map((arg) => this.serializeArg2(arg));
+    this.originalConsole.log(`🌐 [CLIENT LOG] ${level}:`, ...args);
     try {
       await fetch(this.endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           level,
-          args: args.map((arg) => this.serializeArg2(arg)),
+          args: args,
           timestamp: Date.now(),
           caller: callerInfo,
           userAgent: navigator.userAgent,
@@ -94,6 +98,7 @@ export class ConsoleWrapper {
   serializeArg(arg) {
     try {
       if (typeof arg === "string") return arg;
+      if (arg.message) return arg.message;
       if (typeof arg === "object" && arg !== null) {
         return JSON.stringify(arg, null, 2);
       }

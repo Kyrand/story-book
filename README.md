@@ -12,16 +12,19 @@ Built with SvelteKit 2.0+, Svelte 5, TailwindCSS v4, and Better-Auth.
 ## Getting Started
 
 1. Install dependencies:
+
 ```bash
 pnpm install
 ```
 
 2. Start the development server:
+
 ```bash
 make dev
 ```
 
 3. View development logs:
+
 ```bash
 make tail-log
 ```

@@ -107,8 +107,5 @@
 			</button>
 		</div>
 
-		<div class="mt-4 text-center text-sm text-gray-600">
-			<p>Test credentials: kyran@geoproj.test / geoprojector</p>
-		</div>
 	</form>
 </div>
