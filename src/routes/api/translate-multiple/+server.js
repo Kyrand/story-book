@@ -20,6 +20,7 @@ export async function POST({ request, locals }) {
     model = "gpt-3.5-turbo"
   } = await request.json();
 
+
   if (!bookId || !pageNumber || !originalText || !languages || languages.length === 0) {
     return json({ error: "Missing required fields" }, { status: 400 });
   }

@@ -26,6 +26,10 @@
 	let selectedSentenceIndex = $state(null);
 	let isPlaying = $state(false);
 	let audioElement = $state(null);
+	let selectedAudioLanguage = $state(''); // For sentence mode audio language selection
+	let playingSentenceIndex = $state(null); // Track which sentence is playing
+	let sentenceAudioPaths = $state({}); // Cache audio paths for sentences: {lang: {sentenceIndex: audioPath}}
+	let loadingSentenceAudio = $state(false); // Track if we're pre-loading sentence audio
 	
 	// Split content into sentences for highlighting
 	let originalSentences = $derived(splitIntoSentences(pageContent?.content || ''));
@@ -33,23 +37,100 @@
 	let phoneticSentences = $derived(splitIntoSentences(phoneticText)); // For paragraph mode
 	
 	// For sentence mode: split translations for each language
-	let multipleTranslatedSentences = $derived(() => {
-		// Add simple debug - check if we have translations
+	let multipleTranslatedSentences = $state({});
+	
+	// Effect to update translated sentences when translations change
+	$effect(() => {
 		if (Object.keys(multipleTranslations).length === 0) {
-			return {};
+			multipleTranslatedSentences = {};
+			return;
 		}
 		
 		const result = {};
-		for (const lang of languages) {
+		
+		// Process each available translation language
+		for (const lang of Object.keys(multipleTranslations)) {
 			if (multipleTranslations[lang] && multipleTranslations[lang].translatedText) {
+				const translatedSentences = splitIntoSentences(multipleTranslations[lang].translatedText);
+				const phoneticSentences = splitIntoSentences(multipleTranslations[lang].phoneticText || '');
+				
 				result[lang] = {
-					translated: splitIntoSentences(multipleTranslations[lang].translatedText),
-					phonetic: splitIntoSentences(multipleTranslations[lang].phoneticText || '')
+					translated: translatedSentences,
+					phonetic: phoneticSentences
 				};
 			}
 		}
-		return result;
+		
+		multipleTranslatedSentences = result;
 	});
+	
+	// Effect to set default audio language when translations change
+	$effect(() => {
+		if (readingMode === 'sentence' && Object.keys(multipleTranslations).length > 0) {
+			// Set to first available language if not already set
+			if (!selectedAudioLanguage || !multipleTranslations[selectedAudioLanguage]) {
+				selectedAudioLanguage = Object.keys(multipleTranslations)[0];
+			}
+			
+			// Pre-load sentence audio in background for better performance
+			preloadSentenceAudio();
+		}
+	});
+	
+	// Pre-load audio for all sentences to improve performance
+	async function preloadSentenceAudio() {
+		if (loadingSentenceAudio) return; // Already loading
+		
+		loadingSentenceAudio = true;
+		const newAudioPaths = {};
+		
+		try {
+			// Pre-load for each available language
+			for (const lang of Object.keys(multipleTranslations)) {
+				newAudioPaths[lang] = {};
+				
+				// Generate audio for each sentence in parallel (but limit concurrency)
+				const sentencePromises = originalSentences.map(async (sentence, index) => {
+					try {
+						const response = await fetch('/api/translate', {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify({
+								bookId: data.session.book_id,
+								pageNumber: `${currentPage}_sentence_${index}`,
+								originalText: sentence,
+								language: lang,
+								includePhonetic: false,
+								includeAudio: true
+							})
+						});
+						
+						if (response.ok) {
+							const result = await response.json();
+							if (result.audioPath) {
+								newAudioPaths[lang][index] = result.audioPath;
+							}
+						}
+					} catch (error) {
+						console.warn(`Failed to pre-load audio for sentence ${index} in ${lang}:`, error);
+					}
+				});
+				
+				// Process sentences in batches of 3 to avoid overwhelming the server
+				const batchSize = 3;
+				for (let i = 0; i < sentencePromises.length; i += batchSize) {
+					const batch = sentencePromises.slice(i, i + batchSize);
+					await Promise.all(batch);
+				}
+			}
+			
+			sentenceAudioPaths = newAudioPaths;
+		} catch (error) {
+			console.error('Failed to pre-load sentence audio:', error);
+		} finally {
+			loadingSentenceAudio = false;
+		}
+	}
 	
 	// Check if screen is mobile size
 	let isMobile = $state(false);
@@ -154,17 +235,31 @@
 	}
 	
 	async function playAudio() {
-		if (!audioPath) return;
+		let currentAudioPath = '';
+		
+		// Determine audio path based on reading mode
+		if (readingMode === 'paragraph') {
+			currentAudioPath = audioPath;
+		} else if (readingMode === 'sentence' && selectedAudioLanguage && multipleTranslations[selectedAudioLanguage]) {
+			currentAudioPath = multipleTranslations[selectedAudioLanguage].audioPath;
+		}
+		
+		if (!currentAudioPath) return;
 		
 		if (isPlaying && audioElement) {
 			audioElement.pause();
 			isPlaying = false;
+			playingSentenceIndex = null; // Clear any sentence-level playing state
 			return;
 		}
 		
 		try {
-			if (!audioElement) {
-				audioElement = new Audio(`/api/audio/${audioPath}`);
+			// Create new audio element or update source if needed
+			if (!audioElement || audioElement.src !== `/api/audio/${currentAudioPath}`) {
+				if (audioElement) {
+					audioElement.pause();
+				}
+				audioElement = new Audio(`/api/audio/${currentAudioPath}`);
 				audioElement.addEventListener('ended', () => {
 					isPlaying = false;
 				});
@@ -172,8 +267,118 @@
 			
 			await audioElement.play();
 			isPlaying = true;
+			playingSentenceIndex = null; // Clear sentence-level playing state for page-level audio
 		} catch (error) {
 			console.error('Failed to play audio:', error);
+		}
+	}
+	
+	async function playSentenceAudio(sentenceIndex, language) {
+		if (playingSentenceIndex === sentenceIndex && isPlaying) {
+			// Stop current playback
+			if (audioElement) {
+				audioElement.pause();
+				isPlaying = false;
+				playingSentenceIndex = null;
+			}
+			return;
+		}
+		
+		// Check if we have pre-loaded audio for this sentence
+		const preloadedPath = sentenceAudioPaths[language]?.[sentenceIndex];
+		
+		if (preloadedPath) {
+			// Use pre-loaded audio for instant playback
+			try {
+				// Stop any current audio
+				if (audioElement) {
+					audioElement.pause();
+				}
+				
+				// Create new audio element for this sentence
+				audioElement = new Audio(`/api/audio/${preloadedPath}`);
+				audioElement.addEventListener('ended', () => {
+					isPlaying = false;
+					playingSentenceIndex = null;
+				});
+				
+				await audioElement.play();
+				isPlaying = true;
+				playingSentenceIndex = sentenceIndex;
+				return;
+			} catch (error) {
+				console.error('Failed to play pre-loaded sentence audio:', error);
+			}
+		}
+		
+		// Fallback: Generate audio on-demand if not pre-loaded
+		const originalSentence = originalSentences[sentenceIndex];
+		if (!originalSentence) return;
+		
+		try {
+			const response = await fetch('/api/translate', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					bookId: data.session.book_id,
+					pageNumber: `${currentPage}_sentence_${sentenceIndex}`,
+					originalText: originalSentence,
+					language: language,
+					includePhonetic: false,
+					includeAudio: true
+				})
+			});
+			
+			if (response.ok) {
+				const result = await response.json();
+				if (result.audioPath) {
+					// Cache this for future use
+					if (!sentenceAudioPaths[language]) {
+						sentenceAudioPaths[language] = {};
+					}
+					sentenceAudioPaths[language][sentenceIndex] = result.audioPath;
+					
+					// Stop any current audio
+					if (audioElement) {
+						audioElement.pause();
+					}
+					
+					// Create new audio element for this sentence
+					audioElement = new Audio(`/api/audio/${result.audioPath}`);
+					audioElement.addEventListener('ended', () => {
+						isPlaying = false;
+						playingSentenceIndex = null;
+					});
+					
+					await audioElement.play();
+					isPlaying = true;
+					playingSentenceIndex = sentenceIndex;
+				}
+			}
+		} catch (error) {
+			console.error('Failed to play sentence audio:', error);
+		}
+	}
+	
+	async function toggleReadingMode() {
+		const newMode = readingMode === 'paragraph' ? 'sentence' : 'paragraph';
+		
+		try {
+			// Update the reading session mode in the database
+			const response = await fetch(`/api/sessions/${data.session.id}/reading-mode`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ readingMode: newMode })
+			});
+			
+			if (response.ok) {
+				// Reload the page to apply the new reading mode
+				window.location.reload();
+			} else {
+				console.error('Failed to update reading mode:', await response.text());
+			}
+		} catch (error) {
+			console.error('Error updating reading mode:', error);
 		}
 	}
 	
@@ -204,6 +409,16 @@
 				</div>
 				
 				<div class="flex items-center gap-2 sm:gap-4">
+					<!-- Reading Mode Toggle -->
+					<button
+						onclick={toggleReadingMode}
+						class="px-2 sm:px-3 py-1 text-xs sm:text-sm rounded-md border-2 transition-colors {readingMode === 'sentence' ? 'bg-purple-100 text-purple-700 border-purple-300' : 'bg-orange-100 text-orange-700 border-orange-300'} hover:opacity-80"
+						title="Switch between paragraph and sentence reading modes"
+					>
+						<span class="sm:hidden">{readingMode === 'sentence' ? '📝' : '📄'}</span>
+						<span class="hidden sm:inline">{readingMode === 'sentence' ? '📝 Sentence' : '📄 Paragraph'}</span>
+					</button>
+					
 					<button
 						onclick={togglePhonetic}
 						class="px-2 sm:px-3 py-1 text-xs sm:text-sm rounded-md {showPhonetic ? 'bg-blue-100 text-blue-700 border-2 border-blue-300' : 'bg-gray-100 text-gray-700'}"
@@ -214,14 +429,33 @@
 						{#if showPhonetic}<span class="text-xs">(ON)</span>{/if}
 					</button>
 					
+					<!-- Language selector for sentence mode audio -->
+					{#if readingMode === 'sentence' && Object.keys(multipleTranslations).length > 1}
+						<select 
+							bind:value={selectedAudioLanguage}
+							class="px-2 py-1 text-xs rounded-md bg-gray-100 text-gray-700 border border-gray-300"
+							title="Select audio language"
+						>
+							{#each Object.keys(multipleTranslations) as lang}
+								<option value={lang}>{LANGUAGES[lang]?.name || lang.toUpperCase()}</option>
+							{/each}
+						</select>
+					{/if}
+					
 					<button
 						onclick={playAudio}
-						disabled={!audioPath || isLoading}
-						class="px-2 sm:px-3 py-1 text-xs sm:text-sm rounded-md bg-green-100 text-green-700 disabled:opacity-50"
-						title="Play audio"
+						disabled={isLoading || (readingMode === 'paragraph' && !audioPath) || (readingMode === 'sentence' && (!selectedAudioLanguage || !multipleTranslations[selectedAudioLanguage]?.audioPath))}
+						class="px-2 sm:px-3 py-1 text-xs sm:text-sm rounded-md bg-green-100 text-green-700 disabled:opacity-50 flex items-center gap-1"
+						title="Play audio for entire page"
 					>
-						{isPlaying ? '⏸️' : '▶️'}
+						{isPlaying && !playingSentenceIndex ? '⏸️' : '▶️'}
 						<span class="hidden sm:inline"> Audio</span>
+						{#if readingMode === 'sentence' && selectedAudioLanguage}
+							<span class="text-xs opacity-75">({LANGUAGES[selectedAudioLanguage]?.iso || selectedAudioLanguage.toUpperCase()})</span>
+						{/if}
+						{#if loadingSentenceAudio}
+							<span class="text-xs opacity-75" title="Pre-loading sentence audio...">⏳</span>
+						{/if}
 					</button>
 					
 					<span class="text-xs sm:text-sm text-gray-500">
@@ -239,16 +473,6 @@
 				<div class="text-gray-500">Loading translation...</div>
 			</div>
 		{:else if readingMode === 'sentence'}
-			<!-- Debug info -->
-			{#if Object.keys(multipleTranslations).length === 0}
-				<div class="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded">
-					<p class="text-sm text-yellow-800">🔄 Loading translations for {languages.join(', ')}...</p>
-				</div>
-			{:else}
-				<div class="mb-4 p-4 bg-green-50 border border-green-200 rounded">
-					<p class="text-sm text-green-800">✅ Loaded translations for {Object.keys(multipleTranslations).join(', ')}</p>
-				</div>
-			{/if}
 			
 			<!-- Sentence Mode: Horizontal stacking with colored chips -->
 			<div class="space-y-6">
@@ -273,26 +497,41 @@
 						<div class="space-y-3">
 							{#each languages as lang}
 								{#if multipleTranslatedSentences[lang]?.translated[index]}
-									<button
-										onclick={() => selectSentence(index)}
-										class="text-left w-full p-4 rounded-lg transition-colors
-											{selectedSentenceIndex === index ? `${LANGUAGES[lang].bgColor} border-2 ${LANGUAGES[lang].borderColor}` : 'hover:bg-gray-50 border border-gray-200'}"
-									>
-										<div class="flex items-center gap-2 mb-2">
-											<span class="text-xs px-2 py-1 rounded {LANGUAGES[lang].bgColor} {LANGUAGES[lang].textColor} border {LANGUAGES[lang].borderColor}">
-												{LANGUAGES[lang].iso}
-											</span>
-											<span class="text-xs text-gray-500">{LANGUAGES[lang].name}</span>
-										</div>
-										<p class="text-lg leading-relaxed">
-											{multipleTranslatedSentences[lang].translated[index]}
-										</p>
-										{#if showPhonetic && multipleTranslatedSentences[lang].phonetic[index]}
-											<p class="text-sm text-gray-500 mt-2 italic">
-												{multipleTranslatedSentences[lang].phonetic[index]}
+									<div class="relative">
+										<button
+											onclick={() => selectSentence(index)}
+											class="text-left w-full p-4 rounded-lg transition-colors
+												{selectedSentenceIndex === index ? `${LANGUAGES[lang].bgColor} border-2 ${LANGUAGES[lang].borderColor}` : 'hover:bg-gray-50 border border-gray-200'}"
+										>
+											<div class="flex items-center gap-2 mb-2">
+												<span class="text-xs px-2 py-1 rounded {LANGUAGES[lang].bgColor} {LANGUAGES[lang].textColor} border {LANGUAGES[lang].borderColor}">
+													{LANGUAGES[lang].iso}
+												</span>
+												<span class="text-xs text-gray-500">{LANGUAGES[lang].name}</span>
+											</div>
+											<p class="text-lg leading-relaxed">
+												{multipleTranslatedSentences[lang].translated[index]}
 											</p>
-										{/if}
-									</button>
+											{#if showPhonetic && multipleTranslatedSentences[lang].phonetic[index]}
+												<p class="text-sm text-gray-500 mt-2 italic">
+													{multipleTranslatedSentences[lang].phonetic[index]}
+												</p>
+											{/if}
+										</button>
+										
+										<!-- Individual sentence audio button -->
+										<button
+											onclick={(e) => {
+												e.stopPropagation();
+												playSentenceAudio(index, lang);
+											}}
+											class="absolute top-2 right-2 p-1 text-xs rounded-full bg-white shadow-sm border border-gray-200 hover:bg-gray-50 transition-colors
+												{playingSentenceIndex === index && isPlaying ? 'bg-green-100 text-green-700' : 'text-gray-600'}"
+											title="Play this sentence"
+										>
+											{playingSentenceIndex === index && isPlaying ? '⏸️' : '🔊'}
+										</button>
+									</div>
 								{/if}
 							{/each}
 						</div>
